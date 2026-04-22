@@ -1,8 +1,26 @@
+import threading
+import time
+from dataclasses import dataclass
+
 import requests
 from urllib.parse import quote
 from config import VEEVA_VAULT_URL, VEEVA_USERNAME, VEEVA_PASSWORD
 
 API_VERSION = "v24.1"
+
+_STOP_WORDS = {
+    "what", "are", "the", "is", "a", "an", "in", "of", "for", "with",
+    "about", "how", "does", "do", "can", "will", "to", "and", "or",
+    "related", "available", "information", "please", "tell", "me",
+    "regarding", "on", "at", "by", "from", "their", "its",
+}
+
+
+def _keywords(query: str) -> str:
+    """Extract meaningful search terms from a natural-language question."""
+    words = [w.strip("?.,!") for w in query.lower().split()]
+    keywords = [w for w in words if w and w not in _STOP_WORDS]
+    return " ".join(keywords) if keywords else query
 
 
 def authenticate() -> str:
@@ -23,7 +41,7 @@ def search_veeva(query: str, session_id: str, max_results: int = 5) -> list[dict
     vql = (
         f"SELECT id, name__v, title__v, document_number__v "
         f"FROM documents "
-        f"WHERE name__v CONTAINS ('{safe_query}') "
+        f"FIND('{safe_query}') "
         f"LIMIT {max_results}"
     )
     url = f"{VEEVA_VAULT_URL}/api/{API_VERSION}/query"
@@ -33,18 +51,56 @@ def search_veeva(query: str, session_id: str, max_results: int = 5) -> list[dict
     }, timeout=20)
     resp.raise_for_status()
     body = resp.json()
-    if body.get("responseStatus") != "SUCCESS":
+    if body.get("responseStatus") not in ("SUCCESS", "WARNING"):
         raise RuntimeError(f"Veeva query failed: {body.get('errors', body)}")
 
     docs = []
     for record in body.get("data", []):
         docs.append({
             "id": record.get("id", ""),
-            "title": record.get("title__v", record.get("name__v", "")),
+            "title": record.get("title__v") or record.get("name__v", ""),
             "document_number": record.get("document_number__v", ""),
             "summary": _fetch_summary(record.get("id", ""), session_id),
         })
     return docs
+
+
+_SESSION_TTL = 25 * 60  # Veeva sessions last 30 min; refresh at 25
+
+
+@dataclass
+class _VeevaSession:
+    session_id: str = ""
+    expires_at: float = 0.0
+
+
+_session = _VeevaSession()
+_lock = threading.Lock()
+
+
+def get_session() -> str:
+    """Return a valid cached Veeva session_id, re-authenticating if expired."""
+    with _lock:
+        if time.monotonic() < _session.expires_at:
+            return _session.session_id
+        sid = authenticate()
+        _session.session_id = sid
+        _session.expires_at = time.monotonic() + _SESSION_TTL
+        return sid
+
+
+def search_veeva_auto(query: str, max_results: int = 5) -> list[dict]:
+    """search_veeva with automatic session management (used by MCP server)."""
+    sid = get_session()
+    kw_query = _keywords(query)
+    try:
+        return search_veeva(kw_query, sid, max_results)
+    except RuntimeError as exc:
+        if "INVALID_SESSION_ID" in str(exc) or "401" in str(exc):
+            with _lock:
+                _session.expires_at = 0.0  # force refresh on next call
+            return search_veeva(kw_query, get_session(), max_results)
+        raise
 
 
 def _fetch_summary(doc_id: str, session_id: str) -> str:

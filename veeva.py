@@ -3,10 +3,9 @@ import time
 from dataclasses import dataclass
 
 import requests
-from urllib.parse import quote
 from config import VEEVA_VAULT_URL, VEEVA_USERNAME, VEEVA_PASSWORD
 
-API_VERSION = "v24.1"
+API_VERSION = "v26.1"
 
 _STOP_WORDS = {
     "what", "are", "the", "is", "a", "an", "in", "of", "for", "with",
@@ -39,7 +38,7 @@ def authenticate() -> str:
 def search_veeva(query: str, session_id: str, max_results: int = 5) -> list[dict]:
     safe_query = query.replace("'", "''")
     vql = (
-        f"SELECT id, name__v, title__v, document_number__v "
+        f"SELECT id, name__v, document_number__v, major_version_number__v, minor_version_number__v "
         f"FROM documents "
         f"FIND('{safe_query}') "
         f"LIMIT {max_results}"
@@ -56,11 +55,14 @@ def search_veeva(query: str, session_id: str, max_results: int = 5) -> list[dict
 
     docs = []
     for record in body.get("data", []):
+        doc_id = record.get("id", "")
         docs.append({
-            "id": record.get("id", ""),
-            "title": record.get("title__v") or record.get("name__v", ""),
+            "id": doc_id,
+            "name": record.get("name__v", ""),
             "document_number": record.get("document_number__v", ""),
-            "summary": _fetch_summary(record.get("id", ""), session_id),
+            "major_version": record.get("major_version_number__v", 1),
+            "minor_version": record.get("minor_version_number__v", 0),
+            "url": f"{VEEVA_VAULT_URL}/ui/#doc_info/{doc_id}",
         })
     return docs
 
@@ -103,18 +105,10 @@ def search_veeva_auto(query: str, max_results: int = 5) -> list[dict]:
         raise
 
 
-def _fetch_summary(doc_id: str, session_id: str) -> str:
-    if not doc_id:
-        return ""
-    url = f"{VEEVA_VAULT_URL}/api/{API_VERSION}/objects/documents/{doc_id}"
-    try:
-        resp = requests.get(url, headers={
-            "Authorization": session_id,
-            "Accept": "application/json",
-        }, timeout=15)
-        resp.raise_for_status()
-        body = resp.json()
-        fields = body.get("document", {})
-        return fields.get("description__v", "") or fields.get("abstract__v", "")
-    except Exception:
-        return ""
+def get_document_content(doc_id: int | str, major_version: int = 1, minor_version: int = 0) -> str:
+    """Retrieve plain text of a Veeva Vault document using the version text endpoint."""
+    sid = get_session()
+    url = f"{VEEVA_VAULT_URL}/api/{API_VERSION}/objects/documents/{doc_id}/versions/{major_version}/{minor_version}/text"
+    resp = requests.get(url, headers={"Authorization": sid, "Accept": "text/plain"}, timeout=30)
+    resp.raise_for_status()
+    return resp.text.strip()
